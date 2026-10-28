@@ -1,47 +1,252 @@
+
 import requests
+import datetime
+import math
 
-holdings = {
-    "solana": 3,
-    "ethereum": 1,
-    "ripple": 2,
-    "binancecoin": 4,
-}
 
-url = "https://api.coingecko.com/api/v3/simple/price"
-parameters = {
-    "ids": ",".join(holdings.keys()),
-    "vs_currencies": "usd",
-}
+API_URL = "https://api.coingecko.com/api/v3/coins/markets"
 
-try:
-    response = requests.get(url, params=parameters, timeout=15)
-    response.raise_for_status()
-    prices = response.json()
-except requests.exceptions.RequestException as error:
-    print(f"Could not get prices from CoinGecko: {error}")
-    raise SystemExit(1)
-except ValueError as error:
-    print(f"CoinGecko returned invalid data: {error}")
-    raise SystemExit(1)
+transactions = [
+    {"coin": "solana", "type": "buy", "quantity": 2, "price": 110.0},
+    {"coin": "ethereum", "type": "buy", "quantity": 1, "price": 2600.0},
+    {"coin": "ripple", "type": "buy", "quantity": 5, "price": 0.75},
+    {"coin": "binancecoin", "type": "buy", "quantity": 1, "price": 340.0},
+]
 
-total_value = 0
-all_prices_found = True
 
-print("Crypto portfolio (USD)")
-print("----------------------")
+def add_transaction(coin, transaction_type, quantity, price):
+    coin_name = "" if coin is None else str(coin).strip().lower()
+    kind = str(transaction_type).strip().lower()
 
-for coin, amount in holdings.items():
-    if coin not in prices or "usd" not in prices[coin]:
-        print(f"{coin}: price unavailable")
-        all_prices_found = False
-        continue
+    if coin_name == "":
+        print("Error: coin name is missing")
+        return False
 
-    price = prices[coin]["usd"]
-    value = amount * price
-    total_value += value
-    print(f"{coin}: {amount} held at ${price:,.2f} each = ${value:,.2f}")
+    if kind not in ["buy", "sell"]:
+        print("Error: type must be 'buy' or 'sell'")
+        return False
 
-if all_prices_found:
-    print(f"Total value: ${total_value:,.2f}")
-else:
-    print(f"Partial total: ${total_value:,.2f} (some prices unavailable)")
+    try:
+        quantity = float(quantity)
+        price = float(price)
+    except (TypeError, ValueError):
+        print("Error: quantity and price must be numbers")
+        return False
+
+    if not math.isfinite(quantity) or quantity <= 0:
+        print("Error: quantity must be greater than 0")
+        return False
+
+    if not math.isfinite(price) or price <= 0:
+        print("Error: price must be greater than 0")
+        return False
+
+    if kind == "sell":
+        holdings = calculate_holdings(transactions)
+        owned = holdings.get(coin_name, {}).get("quantity", 0)
+        if quantity > owned:
+            print(f"Error: you cannot sell more {coin_name} than you own")
+            return False
+
+    transactions.append(
+        {
+            "coin": coin_name,
+            "type": kind,
+            "quantity": quantity,
+            "price": price,
+            "timestamp": datetime.datetime.now().isoformat(),
+        }
+    )
+    return True
+
+
+def get_prices_from_api(transaction_list):
+    coin_ids = sorted(
+        {
+            str(record.get("coin", "")).strip().lower()
+            for record in transaction_list
+            if isinstance(record, dict) and record.get("coin")
+        }
+    )
+    if not coin_ids:
+        return {}
+
+    params = {
+        "vs_currency": "usd",
+        "ids": ",".join(coin_ids),
+    }
+
+    try:
+        response = requests.get(API_URL, params=params, timeout=15)
+        response.raise_for_status()
+        data = response.json()
+
+        if not isinstance(data, list) or not data:
+            print("API returned no data")
+            return {}
+
+        prices = {}
+        for coin in data:
+            if not isinstance(coin, dict):
+                continue
+            coin_id = coin.get("id")
+            current_price = coin.get("current_price")
+            if coin_id and current_price is not None:
+                try:
+                    current_price = float(current_price)
+                except (TypeError, ValueError):
+                    continue
+                if math.isfinite(current_price) and current_price > 0:
+                    prices[coin_id] = current_price
+
+        return prices
+    except requests.RequestException as error:
+        print("API error:", error)
+        return {}
+
+
+def calculate_holdings(transaction_list):
+    holdings = {}
+
+    for record in transaction_list:
+        if not isinstance(record, dict):
+            continue
+        coin = str(record.get("coin", "")).strip().lower()
+        if coin == "":
+            continue
+
+        kind = str(record.get("type", ""))
+
+        if kind not in ("buy", "sell"):
+            continue
+
+        try:
+            quantity = float(record.get("quantity", 0))
+            price = float(record.get("price", 0))
+        except (TypeError, ValueError):
+            continue
+
+        if (
+            not math.isfinite(quantity)
+            or not math.isfinite(price)
+            or quantity <= 0
+            or price <= 0
+        ):
+            continue
+
+        if coin not in holdings:
+            holdings[coin] = {"quantity": 0.0, "total_cost": 0.0}
+
+        if kind == "buy":
+            holdings[coin]["quantity"] += quantity
+            holdings[coin]["total_cost"] += quantity * price
+        elif kind == "sell":
+            if quantity > holdings[coin]["quantity"]:
+                print(f"Cannot sell more {coin} than you own")
+                continue
+            average_cost = (
+                holdings[coin]["total_cost"] / holdings[coin]["quantity"]
+                if holdings[coin]["quantity"] > 0
+                else 0
+            )
+            holdings[coin]["quantity"] -= quantity
+            holdings[coin]["total_cost"] -= quantity * average_cost
+
+    return holdings
+
+
+def calculate_portfolio(transaction_list, prices):
+    holdings = calculate_holdings(transaction_list)
+    summary = []
+    total_value = 0.0
+    total_profit_loss = 0.0
+
+    if not prices:
+        print("Market price data are not available.")
+        return {"coins": [], "total_value": 0.0, "total_profit_loss": 0.0}
+
+    for coin, info in holdings.items():
+        quantity = info["quantity"]
+        if quantity <= 0:
+            continue
+
+        current_price = prices.get(coin)
+        if current_price is None:
+            continue
+
+        current_value = quantity * current_price
+        profit_loss = current_value - info["total_cost"]
+
+        summary.append(
+            {
+                "coin": coin,
+                "quantity": quantity,
+                "current_value": current_value,
+                "profit_loss": profit_loss,
+            }
+        )
+
+        total_value += current_value
+        total_profit_loss += profit_loss
+
+    return {
+        "coins": summary,
+        "total_value": total_value,
+        "total_profit_loss": total_profit_loss,
+    }
+
+
+def show_transaction_history(transaction_list):
+    if not transaction_list:
+        print("No transactions yet")
+        return
+
+    print("\nTRANSACTION HISTORY")
+    print("-------------------")
+    for item in transaction_list:
+        print(item["type"], item["quantity"], item["coin"], "at", item["price"], "USD")
+    print("-------------------")
+
+
+def show_portfolio_summary(transaction_list):
+    prices = get_prices_from_api(transaction_list)
+    portfolio = calculate_portfolio(transaction_list, prices)
+
+    print("\nMY PORTFOLIO")
+    print("----------------")
+
+    if not portfolio["coins"]:
+        print("No valid portfolio data available.")
+        print("TOTAL VALUE: 0.00")
+        print("TOTAL PROFIT OR LOSS: 0.00")
+        return
+
+    for item in portfolio["coins"]:
+        print(item["coin"])
+        print("quantity:", item["quantity"])
+        print("value now:", round(item["current_value"], 2))
+        print("profit or loss:", round(item["profit_loss"], 2))
+        print("----------------")
+
+    print("TOTAL VALUE:", round(portfolio["total_value"], 2))
+    print("TOTAL PROFIT OR LOSS:", round(portfolio["total_profit_loss"], 2))
+
+
+def add_buy_transaction(coin, quantity, price):
+    return add_transaction(coin, "buy", quantity, price)
+
+
+def add_sell_transaction(coin, quantity, price):
+    return add_transaction(coin, "sell", quantity, price)
+
+
+if __name__ == "__main__":
+    add_buy_transaction("solana", 3, 130)
+    add_sell_transaction("ripple", 1, 0.90)
+
+    show_transaction_history(transactions)
+    show_portfolio_summary(transactions)
+
+
+
+
